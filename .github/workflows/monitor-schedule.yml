@@ -1,0 +1,19 @@
+name: 국립공원 생태탐방원 24시간 자동 모니터링
+
+on:
+  schedule:
+    # 5분마다 자동 실행 (GitHub Actions 무료 스케줄러)
+    - cron: "*/5 * * * *"
+  workflow_dispatch: # GitHub 화면에서 'Run workflow' 버튼으로 즉시 수동 테스트 가능
+
+jobs:
+  check-knps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 파수꾼 관제소 깨우기 및 실시간 잔여석 점검 실행
+        run: |
+          echo "파수꾼 모니터링 서버를 호출해 10개 국립공원 생태탐방원 잔여석을 확인합니다..."
+          RESPONSE=$(curl -s -S -X POST "https://knps-eco-watch.baze.cloud/api/monitors/check-due" \
+            -H "Content-Type: application/json" \
+            -d '{"forceAll": false}')
+          echo "점검 결과: $RESPONSE"
