@@ -710,7 +710,7 @@ export async function sendTelegramAlert(
 export async function runMonitorTarget(
   env: Bindings,
   target: MonitorTargetRow,
-  options?: { forceAlertTest?: boolean }
+  options?: { forceAlertTest?: boolean; simulateAlertOnly?: boolean }
 ) {
   const authCookie =
     target.auth_env_key && typeof env[target.auth_env_key] === "string"
@@ -721,6 +721,15 @@ export async function runMonitorTarget(
     target.adapter_type === "knps-eco"
       ? await collectKnpsEco(target, authCookie)
       : await collectGenericPage(target, authCookie);
+
+  // 조회하는 사이에 다른 요청이 이미 상태를 바꿨을 수 있으므로 최신 해시를 DB에서 다시 읽는다.
+  const latestRow = await env.DB.prepare(
+    "SELECT last_alert_hash, last_alerted_at FROM monitor_targets WHERE id = ?"
+  )
+    .bind(target.id)
+    .first<{ last_alert_hash: string; last_alerted_at: string }>();
+  const latestAlertHash = latestRow?.last_alert_hash ?? target.last_alert_hash;
+  const latestAlertedAt = latestRow?.last_alerted_at ?? target.last_alerted_at;
 
   const conditionMet =
     options?.forceAlertTest ||
@@ -749,9 +758,18 @@ export async function runMonitorTarget(
   const nowIso = new Date().toISOString();
 
   if (conditionMet) {
-    if (!options?.forceAlertTest && target.last_alert_hash === currentAlertHash) {
+    if (!options?.forceAlertTest && latestAlertHash === currentAlertHash) {
       alertStatus = "skipped_duplicate";
       alertMessage = "직전 알림과 동일한 잔여/추출 상태여서 중복 알림을 방지했어요.";
+    } else if (options?.simulateAlertOnly && !options?.forceAlertTest) {
+      alertStatus = "simulated";
+      alertMessage = [
+        `[미리보기 중복발송 차단됨 · 실제 발송은 배포 사이트가 전담]`,
+        `🔔 [파수꾼 감지 알림] ${target.name}`,
+        `• 상태: 조건 충족 (${target.condition_op} ${target.condition_val})`,
+        `• 현재 수집값: ${result.extractedValue}`,
+        `• 요약: ${result.summary}`,
+      ].join("\n");
     } else {
       alertMessage = [
         `🔔 [파수꾼 감지 알림] ${target.name}`,
@@ -773,11 +791,11 @@ export async function runMonitorTarget(
   const nextAlertHash = conditionMet
     ? alertStatus === "sent" || alertStatus === "simulated" || alertStatus === "skipped_duplicate"
       ? currentAlertHash
-      : target.last_alert_hash
+      : latestAlertHash
     : "";
 
   const nextAlertedAt =
-    alertStatus === "sent" || alertStatus === "simulated" ? nowIso : target.last_alerted_at;
+    alertStatus === "sent" || alertStatus === "simulated" ? nowIso : latestAlertedAt;
 
   await env.DB.prepare(
     `UPDATE monitor_targets

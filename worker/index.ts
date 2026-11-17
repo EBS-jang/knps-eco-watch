@@ -40,12 +40,35 @@ const INITIAL_KNPS_TARGETS = [
 ];
 
 /**
+ * 요청이 배포된 실제 사이트(*.baze.cloud)에서 왔는지, 아니면 작업용 미리보기(localhost / *.e2b.app)에서 왔는지 구분한다.
+ * 실제 텔레그램 자동 알림은 배포된 사이트에서만 발송해 미리보기와 중복 발송되는 현상을 원천 차단한다.
+ */
+function isLiveDeploymentRequest(reqUrl: string, hostHeader?: string, forwardedHost?: string): boolean {
+  const combined = `${reqUrl} ${hostHeader ?? ""} ${forwardedHost ?? ""}`.toLowerCase();
+  if (combined.includes(".baze.cloud")) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * 기본 감시 대상(10개 국립공원 생태탐방원 토요일 생활관 + 공통 수집기 예시)이 누락 없이 등록되어 있는지 확인하고
  * 아직 한 번도 조회되지 않은 대상은 초기 조회를 수행한다.
  */
-async function ensureInitialSeed(env: Bindings) {
-  const { results: existing } = await env.DB.prepare("SELECT url FROM monitor_targets").all<{ url: string }>();
+async function ensureInitialSeed(env: Bindings, isLive: boolean) {
+  const { results: existing } = await env.DB.prepare(
+    "SELECT id, url, selector FROM monitor_targets"
+  ).all<{ id: number; url: string; selector: string }>();
   const existingUrls = new Set(existing.map(r => r.url));
+
+  // 이전 초기 시드 문구('토요일 생활관 잔여 수 (당월·익월 달력 및 객실 상세)')를 명확한 요일 포맷으로 자동 정규화
+  for (const row of existing) {
+    if (row.selector.includes("당월·익월 달력")) {
+      await env.DB.prepare("UPDATE monitor_targets SET selector = ? WHERE id = ?")
+        .bind("요일:토 | 토요일 생활관 잔여 수", row.id)
+        .run();
+    }
+  }
 
   for (const item of INITIAL_KNPS_TARGETS) {
     const url = `https://res.knps.or.kr/eco/searchEcoMonthReservation.do?deptId=${item.deptId}`;
@@ -53,7 +76,7 @@ async function ensureInitialSeed(env: Bindings) {
       await env.DB.prepare(
         `INSERT INTO monitor_targets (
            name, url, adapter_type, selector, interval_min, condition_op, condition_val, enabled, auth_env_key
-         ) VALUES (?, ?, 'knps-eco', '토요일 생활관 잔여 수 (당월·익월 달력 및 객실 상세)', 5, 'gte', '1', 1, '')`
+         ) VALUES (?, ?, 'knps-eco', '요일:토 | 토요일 생활관 잔여 수', 5, 'gte', '1', 1, '')`
       )
         .bind(item.name, url)
         .run();
@@ -75,12 +98,17 @@ async function ensureInitialSeed(env: Bindings) {
   ).all<MonitorTargetRow>();
 
   for (const t of idleTargets) {
-    await runMonitorTarget(env, t);
+    await runMonitorTarget(env, t, { simulateAlertOnly: !isLive });
   }
 }
 
 app.get("/monitors", async c => {
-  await ensureInitialSeed(c.env);
+  const isLive = isLiveDeploymentRequest(
+    c.req.url,
+    c.req.header("host"),
+    c.req.header("x-forwarded-host")
+  );
+  await ensureInitialSeed(c.env, isLive);
   const { results: targets } = await c.env.DB.prepare(
     "SELECT * FROM monitor_targets ORDER BY id ASC"
   ).all<MonitorTargetRow>();
@@ -100,6 +128,7 @@ app.get("/monitors", async c => {
       telegramBotMasked: c.env.TELEGRAM_BOT_TOKEN ? "연결됨 (환경 변수 보호됨)" : "미설정",
       telegramChatMasked: c.env.TELEGRAM_CHAT_ID ? "연결됨 (환경 변수 보호됨)" : "미설정",
       siteAuthConfigured,
+      isLiveDeployment: isLive,
     },
   });
 });
@@ -140,7 +169,12 @@ app.post("/monitors", async c => {
     .first<MonitorTargetRow>();
 
   if (created) {
-    await runMonitorTarget(c.env, created);
+    const isLive = isLiveDeploymentRequest(
+      c.req.url,
+      c.req.header("host"),
+      c.req.header("x-forwarded-host")
+    );
+    await runMonitorTarget(c.env, created, { simulateAlertOnly: !isLive });
   }
 
   const updated = await c.env.DB.prepare("SELECT * FROM monitor_targets WHERE id = ?")
@@ -198,13 +232,23 @@ app.patch("/monitors/:id", async c => {
     .bind(id)
     .first<MonitorTargetRow>();
   if (updated && (b.selector !== undefined || b.condition_op !== undefined || b.condition_val !== undefined)) {
-    const outcome = await runMonitorTarget(c.env, updated);
+    const isLive = isLiveDeploymentRequest(
+      c.req.url,
+      c.req.header("host"),
+      c.req.header("x-forwarded-host")
+    );
+    const outcome = await runMonitorTarget(c.env, updated, { simulateAlertOnly: !isLive });
     return c.json({ target: outcome.target });
   }
   return c.json({ target: updated });
 });
 
 app.post("/monitors/batch-days", async c => {
+  const isLive = isLiveDeploymentRequest(
+    c.req.url,
+    c.req.header("host"),
+    c.req.header("x-forwarded-host")
+  );
   const b = (await c.req.json().catch(() => ({}))) as { days?: string[] };
   const validDays = (b.days ?? []).filter(d => ["금", "토", "일"].includes(d));
   if (validDays.length === 0) return bad(c, "최소 한 개 이상의 요일(금·토·일)을 선택해 주세요.");
@@ -229,7 +273,7 @@ app.post("/monitors/batch-days", async c => {
       .bind(t.id)
       .first<MonitorTargetRow>();
     if (refreshed && refreshed.enabled === 1) {
-      await runMonitorTarget(c.env, refreshed);
+      await runMonitorTarget(c.env, refreshed, { simulateAlertOnly: !isLive });
     }
   }
 
@@ -250,12 +294,26 @@ app.post("/monitors/:id/check", async c => {
     .first<MonitorTargetRow>();
   if (!target) return bad(c, "감시 대상을 찾을 수 없어요.", 404);
 
+  const isLive = isLiveDeploymentRequest(
+    c.req.url,
+    c.req.header("host"),
+    c.req.header("x-forwarded-host")
+  );
   const b = (await c.req.json().catch(() => ({}))) as { forceAlertTest?: boolean };
-  const outcome = await runMonitorTarget(c.env, target, { forceAlertTest: Boolean(b.forceAlertTest) });
+  const outcome = await runMonitorTarget(c.env, target, {
+    forceAlertTest: Boolean(b.forceAlertTest),
+    simulateAlertOnly: !isLive,
+  });
   return c.json(outcome);
 });
 
 app.get("/monitors/check-due", async c => {
+  const isLive = isLiveDeploymentRequest(
+    c.req.url,
+    c.req.header("host"),
+    c.req.header("x-forwarded-host")
+  );
+  await ensureInitialSeed(c.env, isLive);
   const forceAll = c.req.query("force") === "1" || c.req.query("force") === "true";
   const { results: targets } = await c.env.DB.prepare(
     "SELECT * FROM monitor_targets WHERE enabled = 1 ORDER BY id ASC"
@@ -268,7 +326,7 @@ app.get("/monitors/check-due", async c => {
     const lastMs = t.last_checked_at ? Date.parse(t.last_checked_at) : 0;
     const dueMs = t.interval_min * 60 * 1000;
     if (forceAll || !lastMs || now - lastMs >= dueMs - 5000) {
-      const res = await runMonitorTarget(c.env, t);
+      const res = await runMonitorTarget(c.env, t, { simulateAlertOnly: !isLive });
       executed.push({
         id: t.id,
         name: t.name,
@@ -279,10 +337,22 @@ app.get("/monitors/check-due", async c => {
     }
   }
 
-  return c.json({ ok: true, checkedAt: new Date().toISOString(), executedCount: executed.length, executed });
+  return c.json({
+    ok: true,
+    isLiveDeployment: isLive,
+    checkedAt: new Date().toISOString(),
+    executedCount: executed.length,
+    executed,
+  });
 });
 
 app.post("/monitors/check-due", async c => {
+  const isLive = isLiveDeploymentRequest(
+    c.req.url,
+    c.req.header("host"),
+    c.req.header("x-forwarded-host")
+  );
+  await ensureInitialSeed(c.env, isLive);
   const b = (await c.req.json().catch(() => ({}))) as { forceAll?: boolean };
   const { results: targets } = await c.env.DB.prepare(
     "SELECT * FROM monitor_targets WHERE enabled = 1 ORDER BY id ASC"
@@ -295,12 +365,12 @@ app.post("/monitors/check-due", async c => {
     const lastMs = t.last_checked_at ? Date.parse(t.last_checked_at) : 0;
     const dueMs = t.interval_min * 60 * 1000;
     if (b.forceAll || !lastMs || now - lastMs >= dueMs - 5000) {
-      const res = await runMonitorTarget(c.env, t);
+      const res = await runMonitorTarget(c.env, t, { simulateAlertOnly: !isLive });
       executed.push(res);
     }
   }
 
-  return c.json({ executedCount: executed.length, executed });
+  return c.json({ isLiveDeployment: isLive, executedCount: executed.length, executed });
 });
 
 app.post("/monitors/test-connection", async c => {

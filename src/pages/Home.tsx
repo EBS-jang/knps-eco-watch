@@ -81,6 +81,7 @@ interface IntegrationsInfo {
   telegramBotMasked: string;
   telegramChatMasked: string;
   siteAuthConfigured: boolean;
+  isLiveDeployment?: boolean;
 }
 
 const ADAPTER_LABELS: Record<string, string> = {
@@ -162,7 +163,9 @@ export default function Home() {
   });
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<number | null>(null);
-  const [autoLoopOn, setAutoLoopOn] = useState(true);
+  const isLiveHost =
+    typeof window !== "undefined" && window.location.hostname.endsWith(".baze.cloud");
+  const [autoLoopOn, setAutoLoopOn] = useState(isLiveHost);
   const [selectedTargetId, setSelectedTargetId] = useState<number | null>(1);
   const [editingTarget, setEditingTarget] = useState<MonitorTarget | null>(null);
   const [showAddForm, setShowAddForm] = useState(false);
@@ -564,7 +567,7 @@ export default function Home() {
             <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-[#86A894]">
               <span className="inline-flex items-center gap-1.5 rounded-full border border-[#293B31] bg-[#17211C] px-2.5 py-0.5 text-[#6EE7B7]">
                 <span className="h-1.5 w-1.5 rounded-full bg-[#34D399]" />
-                실시간 웹 수집 검증 완료
+                {isLiveHost ? "배포 사이트 (실제 텔레그램 발송 켜짐)" : "미리보기 안전 모드 (중복 발송 차단됨)"}
               </span>
               <span className="inline-flex items-center gap-1 rounded-full border border-[#26312B] bg-[#161D19] px-2.5 py-0.5 text-[#9BA8A0]">
                 <ShieldCheck className="h-3.5 w-3.5 text-[#38BDF8]" />
